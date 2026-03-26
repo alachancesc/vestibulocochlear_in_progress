@@ -1,0 +1,603 @@
+#!/bin/bash
+# VESTIBULOCOCHLEAR TRACTOGRAPHY - Antoine Lachance (2025-2026)
+
+# This script performs ensemble tractography of the CN VIII using fODFs and FA maps
+# from TractoFlow. Anatomical ROIs from both FreeSurfer and the ROIs_mean MNI folder are used to
+# segment and virtually dissect the vestibulocochlear nerve. Tracking is performed in original space over a
+# grid of (step size, theta) combinations, merged, transformed to MNI space, filtered and segmented 
+# into three components (cochlear bundle, inferior vestibular bundle, superior vestibular bundle). Final cleaned bundles are saved
+# in both original (orig_space) and MNI (mni_space) coordinate spaces.
+#FA = 0.2 is used for HCP data; for clinical data, a lower FA threshold (e.g., 0.15) should be considered due to reduced anisotropy.
+
+# EXAMPLE COMMAND
+#
+#   bash vestibulocochlear_second_order.sh \
+#       -s /path/to/subject/folder/sub-01 \
+#       -m /path/to/ROIs_mean \
+#       -o /path/to/output_dir \
+#       -t 10 \
+#       -p 0.5 \
+#       -e 30 \
+#       -f 0.15 \     
+#       -n 20000 \
+#       -g true
+#
+# Notes:
+#   - If -p (step) and -e (theta) are not provided, the script performs ensemble tracking using:
+#       step = {0.1, 0.5, 1.0}
+#       theta = {20, 30, 40}
+#   - GPU option (-g) accelerates local tracking when supported; omit it to run on CPU.
+
+
+
+# Input structure
+#
+#    [input]
+#    ├── sub-01
+#    │   ├── freesurfer
+#    │   │   └─── aparc.DKTatlas+aseg.mgz
+#    │   ├── sub-01__fa.nii.gz
+#    │   ├── sub-01__fodf.nii.gz
+#    │   └── sub-01__T1w.nii.gz
+#    │
+#    ├── S2
+#    .
+#    .
+
+
+# -m : Path to the MNI-space reference folder.
+#       In this project, it should point to the path/to/vestibulocochlear/ROIs_clean/ folder
+#       within the vestibulocochlear GitHub project.
+
+usage() { 
+    echo "$(basename $0) [-s path/to/subject] [-m path/to/mni] [-o output_dir] [-t nb_threads] [-p step_size] [-e theta_deg] [-f fa_threshold] [-n npv] -g true" 1>&2
+    exit 1
+}
+
+
+while getopts "s:m:o:t:p:e:f:n:g:" args; do
+    case "${args}" in
+        s) subject_dir=${OPTARG} ;;
+        m) mni_dir=${OPTARG} ;;
+        o) output_dir=${OPTARG} ;;
+        t) nb_threads=${OPTARG} ;;
+        p) step_size=${OPTARG} ;;
+        e) theta=${OPTARG} ;;
+        f) fa_threshold=${OPTARG} ;;   
+        n) npv=${OPTARG} ;;    
+        g) gpu=${OPTARG} ;;
+        *) usage;;
+    esac
+done
+shift $((OPTIND-1))
+
+if [ -z "${subject_dir}" ] || [ -z "${mni_dir}" ] || [ -z "${output_dir}" ]; then
+    usage
+fi
+
+
+
+
+# If the user provides both step size (-p) and theta (-e) values, the script will use those specific parameters and perform a single run
+# of local_tracking (i.e., no ensemble tractography will be performed).
+
+if [ -n "${step_size}" ] && [ -n "${theta}" ]; then
+    step_list=(${step_size})
+    theta_list=(${theta})
+else
+    step_list=(0.1 0.5 1.0)
+    theta_list=(20 30 40)
+fi
+
+# Default values if not set
+fa_threshold=${fa_threshold:-0.15}
+npv=${npv:-20000}
+
+
+# npv is the total number of seeds per voxel.
+# It is divided by the number of step/theta combinations.
+# The resulting npv_per_run is the number of seeds actually used in each run.
+
+
+
+# number of step/theta combos
+n_combos=$(( ${#step_list[@]} * ${#theta_list[@]} ))
+# seeds per combo (rounded)
+npv_per_run=$(( (npv + n_combos - 1) / n_combos ))  # ceiling division
+echo "Using $npv_per_run seeds per voxel per run (based on $npv total)"
+
+
+
+#opposite_side=leftright
+
+# Enable GPU if available (highly recommended for X times faster processing)
+
+if [ ! -z "${gpu}" ]; then
+    gpu="--use_gpu"
+else
+    gpu=""
+fi
+
+echo "Folder subject: " ${subject_dir}
+echo "Folder MNI: " ${mni_dir}
+echo "Output folder: " ${output_dir}
+echo "Use GPU: " ${gpu}
+echo "Number of threads" ${nb_threads}
+echo "Tracking grid: steps=${step_list[*]}  thetas=${theta_list[*]}"
+
+
+nsub=$(basename "${subject_dir}")
+subject_parent=$(dirname "${subject_dir}")
+
+    
+
+
+
+
+
+mkdir -p ${output_dir}/${nsub}/orig_space/{rois,tracking_vestibulocochlear,transfo}
+mkdir -p ${output_dir}/${nsub}/mni_space/{rois,tracking_vestibulocochlear}
+
+# Per-combo dirs will be created later, inside the loops.
+orig_rois_dir=${output_dir}/${nsub}/orig_space/rois
+mni_rois_dir=${output_dir}/${nsub}/mni_space/rois
+orig_tracking_dir=${output_dir}/${nsub}/orig_space/tracking_vestibulocochlear
+mni_tracking_root=${output_dir}/${nsub}/mni_space/tracking_vestibulocochlear
+trials_dir=${orig_tracking_dir}/trials
+mkdir -p "${trials_dir}"
+
+echo ""
+echo "|------------- PROCESSING CNVIII TRACTOGRAPHY FOR ${nsub} -------------|"
+echo ""
+
+echo "|------------- 1) Registrations -------------|"
+export ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS="${nb_threads}"
+
+echo "Running ANTs registration... (logs saved to ${output_dir}/${nsub}/log.txt)"
+antsRegistrationSyN.sh \
+    -d 3 \
+    -f "${subject_dir}/tractoflow/${nsub}__T1w.nii.gz" \
+    -m "${mni_dir}/MNI/mni_masked.nii.gz" \
+    -t s \
+    -o "${output_dir}/${nsub}/orig_space/transfo/2orig_" \
+    > "${output_dir}/${nsub}/log.txt" 2>&1
+
+
+    ## [ORIG-SPACE] Register all ROIs
+for nroi in vestibular_nuclei_left vestibular_nuclei_right; do
+    antsApplyTransforms \
+    -d 3 \
+    -i ${mni_dir}/MNI/Subcortical/${nroi}.nii.gz \
+    -r ${subject_dir}/tractoflow/${nsub}__T1w.nii.gz \
+    -t ${output_dir}/${nsub}/orig_space/transfo/2orig_1Warp.nii.gz \
+    -t ${output_dir}/${nsub}/orig_space/transfo/2orig_0GenericAffine.mat \
+    -o ${orig_rois_dir}/${nsub}_${nroi}_orig.nii.gz
+
+    scil_volume_math lower_threshold_eq ${orig_rois_dir}/${nsub}_${nroi}_orig.nii.gz 0.5 ${orig_rois_dir}/${nsub}_${nroi}_orig.nii.gz --data_type int16 -f
+done
+    
+
+
+
+
+## [ORIG-SPACE] Reshape aparc.DKTatlas+aseg.mgz
+scil_volume_reslice_to_reference ${subject_dir}/freesurfer/aparc.DKTatlas+aseg.mgz \
+    ${subject_dir}/tractoflow/${nsub}__T1w.nii.gz \
+    ${orig_rois_dir}/${nsub}_aparc.DKTatlas+aseg_orig.nii.gz \
+    --interpolation nearest --keep_dtype -f
+
+echo "|------------- 1) Done -------------|"
+echo ""
+
+echo "|------------- 2) Generate exclusions and inclusions ROI -------------|"
+## [ORIG-SPACE] Exclusions ROI labels
+Left_Cerebral_Cortex=($(seq 1000 1035))
+Right_Cerebral_Cortex=($(seq 2000 2035))
+Left_Cerebral_WM=(2)
+Right_Cerebral_WM=(41) #CEREBELLUM WAS NOT EXCLUDED SINCE THE NERVE EXITS FROM THE CPA AND IS VERY CLOSE. TO CHECK IN THE FUTURE   
+Any_Exclusion_ROI=(${Left_Cerebral_Cortex[*]} ${Right_Cerebral_Cortex[*]} ${Left_Cerebral_WM[*]} ${Right_Cerebral_WM[*]})
+
+echo "|------------- 2.1) any_exclusion_roi_orig -------------|"
+scil_labels_combine ${orig_rois_dir}/${nsub}_any_exclusion_roi_orig.nii.gz \
+    --volume_ids ${orig_rois_dir}/${nsub}_aparc.DKTatlas+aseg_orig.nii.gz ${Any_Exclusion_ROI[*]} \
+    --merge_groups -f
+
+
+# WM mask
+scil_volume_math lower_threshold ${subject_dir}/tractoflow/${nsub}__fa.nii.gz \
+    ${fa_threshold} \
+    ${orig_rois_dir}/${nsub}_wm_mask_${fa_threshold}_orig.nii.gz \
+    --data_type uint8 -f
+
+echo "|------------- 2) Done -------------|"
+echo ""
+
+echo "|------------- 3) Register ROI in MNI space -------------|"
+for nroi in any_exclusion_roi_orig wm_mask_${fa_threshold}_orig aparc.DKTatlas+aseg_orig; do
+    antsApplyTransforms \
+    -d 3 \
+    -i ${orig_rois_dir}/${nsub}_${nroi}.nii.gz \
+    -r ${mni_dir}/MNI/mni_masked.nii.gz \
+    -t ${output_dir}/${nsub}/orig_space/transfo/2orig_1InverseWarp.nii.gz \
+    -t [${output_dir}/${nsub}/orig_space/transfo/2orig_0GenericAffine.mat, 1] \
+    -o ${mni_rois_dir}/${nsub}_${nroi/orig/mni}.nii.gz \
+    -n NearestNeighbor
+
+    scil_volume_math convert ${mni_rois_dir}/${nsub}_${nroi/orig/mni}.nii.gz ${mni_rois_dir}/${nsub}_${nroi/orig/mni}.nii.gz --data_type int16 -f
+done
+
+echo "|------------- 3) Done -------------|"
+echo ""
+
+# =========================
+# Grid over (step, theta)
+# =========================
+for step_size in "${step_list[@]}"; do
+  for theta in "${theta_list[@]}"; do
+    combo_tag=step_${step_size}_theta_${theta}
+    echo "|=== Running combo: ${combo_tag} ===|"
+
+    mkdir -p ${trials_dir}/${combo_tag}
+
+    echo "|------------- 4) [ORIG-SPACE] Generate local tractography with inclusions ROI (${combo_tag}) -------------|"
+    for nside in left right; do
+        # Single run per side per combo 
+        scil_tracking_local \
+            ${subject_dir}/tractoflow/${nsub}__fodf.nii.gz \
+            ${orig_rois_dir}/${nsub}_vestibular_nuclei_${nside}_orig.nii.gz \
+            ${orig_rois_dir}/${nsub}_wm_mask_${fa_threshold}_orig.nii.gz \
+            ${trials_dir}/${combo_tag}/${nsub}_${nside}_from_vestibular_nuclei_${combo_tag}.trk \
+            --npv $npv_per_run \
+            --step ${step_size} \
+            --theta ${theta} \
+            ${gpu} -v -f
+    done
+    echo "|------------- 4) Done -------------|"
+    echo ""
+  done
+done
+
+
+
+# =========================
+#  MERGE ALL TRACKINGS
+# =========================
+
+echo "|============= Concatenating All orig-space tractograms  =============|"
+merged_orig_dir=${orig_tracking_dir}/final_merged
+mkdir -p "${merged_orig_dir}"
+
+for nside in left right; do
+    files=()
+    for step_size in "${step_list[@]}"; do
+      for theta in "${theta_list[@]}"; do
+        combo_tag=step_${step_size}_theta_${theta}
+        f="${trials_dir}/${combo_tag}/${nsub}_${nside}_from_cn8_${combo_tag}.trk"
+
+        if [[ -f "$f" ]]; then
+            files+=("$f")
+        fi 
+      done
+    done
+
+    if (( ${#files[@]} )); then
+          scil_tractogram_math -f concatenate "${files[@]}" \
+            "${merged_orig_dir}/${nsub}_${nside}_from_cn8_merged.trk"
+    else
+        echo "WARN: No files found for ${nside}"
+    fi
+done
+    echo "|============= Merging done =============|"
+    echo ""
+
+   
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+   
+# =========================
+#  REGISTER MERGED TRACTOGRAM
+# =========================
+    
+
+echo "|------------- 5) Register merged Tracking in MNI space -------------|"
+merged_mni_dir="${mni_tracking_root}/final_merged"
+
+
+
+mkdir -p \
+    "${merged_mni_dir}/orig" \
+    "${merged_mni_dir}/filtered" \
+    "${merged_mni_dir}/final" \
+    "${merged_mni_dir}/segmented/ROIs" \
+    "${merged_mni_dir}/segmented/outliers" \
+    "${merged_mni_dir}/segmented/length"
+
+
+for nside in left right; do
+  in_trk="${merged_orig_dir}/${nsub}_${nside}_from_cn8_merged.trk"
+  out_trk="${merged_mni_dir}/orig/${nsub}_${nside}_from_cn8_merged.trk"
+
+  if [[ -f "${in_trk}" ]]; then
+    scil_tractogram_apply_transform \
+      "${in_trk}" \
+      "${mni_dir}/MNI/mni_masked.nii.gz" \
+      "${output_dir}/${nsub}/orig_space/transfo/2orig_0GenericAffine.mat" \
+      "${out_trk}" \
+      --in_deformation "${output_dir}/${nsub}/orig_space/transfo/2orig_1Warp.nii.gz" \
+      --remove_invalid \
+      --reverse_operation -f
+  fi
+done
+echo "|------------- 5) Done -------------|"
+echo ""
+
+
+# =========================
+#  FILTER FINAL MERGED ONLY ONCE
+# =========================
+
+echo "|------------- 6) [MNI-SPACE] Filtering merged tractograms -------------|"
+
+
+for nside in left right; do
+   in_trk="${merged_mni_dir}/orig/${nsub}_${nside}_from_cn8_merged.trk"
+   out_trk="${merged_mni_dir}/filtered/${nsub}_${nside}_from_cn8_filtered.trk"
+
+ # decide the opposite side
+   if [[ "${nside}" == "left" ]]; then
+       opp_side="right"
+   else
+       opp_side="left"
+   fi
+
+   if [[ -f "${in_trk}" ]]; then      
+   scil_tractogram_filter_by_roi "${in_trk}" "${out_trk}" \
+       --drawn_roi "${mni_rois_dir}/${nsub}_any_exclusion_roi_mni.nii.gz" 'any' 'exclude' \
+       --no_empty \
+       -f
+   else
+     echo "WARN: ${in_trk} not found, skipping filtering for ${nside}"
+   fi 
+
+done
+    echo "|------------- 6) Done -------------|"
+    echo ""
+
+# Remove intermediate MNI-space "orig" tractograms to avoid duplication on disk
+rm -rf "${merged_mni_dir}/orig"
+
+
+
+new_coronal="${mni_dir}/MNI/new_coronal.nii.gz"
+new_lower="${mni_dir}/MNI/new_lower.nii.gz"
+
+
+
+
+
+
+
+
+
+
+
+
+
+# RENDU ICI
+
+
+
+
+
+
+
+
+# =========================
+#  SEGMENT ONLY FINAL FILTERED FILE
+# =========================
+
+echo "|------------- 7) [MNI-SPACE] Segmentation -------------|"
+for nside in left right; do
+    fin="${merged_mni_dir}/filtered/${nsub}_${nside}_from_cn8_filtered.trk"
+
+    # choose thalamus ROI to exclude based on side
+    if [[ "${nside}" == "left" ]]; then
+        thal_roi="${mni_dir}/MNI/left_thalamus_231_245_brainnetome__to_mni_masked.nii.gz"
+    else
+        thal_roi="${mni_dir}/MNI/right_thalamus_232_246_brainnetome__to_mni_masked.nii.gz"
+    fi
+
+
+    ## Cochlear
+    scil_tractogram_filter_by_roi "${fin}" \
+      "${merged_mni_dir}/segmented/ROIs/${nsub}_${nside}_cochlear.trk"  \
+      --drawn_roi "${mni_dir}/MNI/from_${nside}/spiral.nii.gz" 'either_end' 'include' \
+      --drawn_roi "${new_coronal}" 'any' 'include' \
+      --no_empty \
+      -f
+
+done
+
+
+
+echo "|------------- 7) Done -------------|"
+echo ""
+
+
+
+# =========================
+#  CLEANING FINAL BUNDLES
+# =========================
+
+
+
+
+echo "|------------- 8) Cleaning ---------|"
+
+
+for nside in left right; do
+    # ----- 8.1 Mesencephalic -----
+
+    # Length-filter  the left and right mesencephalic bundle: 35< length < 70 mm now 35-70
+    
+    scil_tractogram_filter_by_length \
+        "${merged_mni_dir}/segmented/ROIs/${nsub}_${nside}_mesencephalic.trk" \
+        "${merged_mni_dir}/segmented/length/${nsub}_${nside}_mesencephalic_len35_70.trk" \
+        --minL 35 --maxL 70 --display_counts -f
+
+
+
+    cp -f \
+        "${merged_mni_dir}/segmented/length/${nsub}_${nside}_mesencephalic_len35_70.trk" \
+        "${merged_mni_dir}/final/${nsub}_${nside}_mesencephalic.trk"
+    
+    # outlier-rejection
+    scil_bundle_reject_outliers \
+      "${merged_mni_dir}/segmented/length/${nsub}_${nside}_mesencephalic_len35_70.trk" \
+      "${merged_mni_dir}/segmented/outliers/${nsub}_${nside}_mesencephalic.trk" \
+     -f
+      
+
+    cp "${merged_mni_dir}/segmented/outliers/${nsub}_${nside}_mesencephalic.trk" \
+       "${merged_mni_dir}/final/${nsub}_${nside}_mesencephalic.trk"
+
+
+    # ----- 8.2 spinal -----
+    
+    # Length-filter the left and right spinal bundle: 10< length < 55 mm
+    scil_tractogram_filter_by_length \
+         "${merged_mni_dir}/segmented/ROIs/${nsub}_${nside}_spinal.trk" \
+        "${merged_mni_dir}/segmented/length/${nsub}_${nside}_spinal_len10_55.trk" \
+        --minL 10 --maxL 55 --display_counts -f
+
+
+    cp -f \
+        "${merged_mni_dir}/segmented/length/${nsub}_${nside}_spinal_len10_55.trk" \
+        "${merged_mni_dir}/final/${nsub}_${nside}_spinal.trk"
+    
+
+    # outlier-rejection
+    scil_bundle_reject_outliers \
+      "${merged_mni_dir}/segmented/length/${nsub}_${nside}_spinal_len10_55.trk" \
+      "${merged_mni_dir}/segmented/outliers/${nsub}_${nside}_spinal.trk" \
+      -f
+
+    cp "${merged_mni_dir}/segmented/outliers/${nsub}_${nside}_spinal.trk" \
+       "${merged_mni_dir}/final/${nsub}_${nside}_spinal.trk"
+
+     
+    # ----- 8.3 remaining cn8 -----
+    
+    # Length-filter the left and right remaining_cn8 bundle: 8< length < 37 mm
+    
+    scil_tractogram_filter_by_length \
+        "${merged_mni_dir}/segmented/ROIs/${nsub}_${nside}_remaining_cn8.trk" \
+        "${merged_mni_dir}/segmented/length/${nsub}_${nside}_remaining_cn8_len8_37.trk" \
+        --minL 8 --maxL 37 --display_counts -f
+
+
+    cp -f \
+        "${merged_mni_dir}/segmented/length/${nsub}_${nside}_remaining_cn8_len8_37.trk" \
+        "${merged_mni_dir}/final/${nsub}_${nside}_remaining_cn8.trk"
+    
+    
+    # outlier-rejection
+    scil_bundle_reject_outliers \
+      "${merged_mni_dir}/segmented/length/${nsub}_${nside}_remaining_cn8_len8_37.trk" \
+       "${merged_mni_dir}/segmented/outliers/${nsub}_${nside}_remaining_cn8.trk" \
+       --alpha 0.97 -f
+
+    cp -f \
+        "${merged_mni_dir}/segmented/outliers/${nsub}_${nside}_remaining_cn8.trk" \
+        "${merged_mni_dir}/final/${nsub}_${nside}_remaining_cn8.trk"
+
+    
+
+    # Orientation filter last
+    scil_tractogram_filter_by_orientation \
+        "${merged_mni_dir}/final/${nsub}_${nside}_remaining_cn8.trk" \
+        "${merged_mni_dir}/final/${nsub}_${nside}_remaining_cn8.trk" \
+        --max_z 7 --use_abs -f
+
+
+
+    
+done
+
+    echo "|------------- 8) Done  -------------|"
+    echo ""
+    
+
+
+# =========================
+#  9) BRING FINAL MNI BUNDLES BACK TO ORIG SPACE
+# =========================
+
+echo "|------------- 9) [BACK-TO-ORIG] Register final MNI bundles to orig space -------------|"
+
+orig_final_dir="${orig_tracking_dir}/final_merged/final"
+mkdir -p "${orig_final_dir}"
+
+# We know:
+# - MNI final bundles: ${merged_mni_dir}/final/${nsub}_${nside}_<bundle>.trk
+# - We want orig-space final bundles in: ${orig_final_dir}/${nsub}_${nside}_<bundle>_orig.trk
+
+for nside in left right; do
+    for bundle in mesencephalic spinal remaining_cn8; do
+        in_trk="${merged_mni_dir}/final/${nsub}_${nside}_${bundle}.trk"
+        out_trk="${orig_final_dir}/${nsub}_${nside}_${bundle}_orig.trk"
+
+        if [[ -f "${in_trk}" ]]; then
+            scil_tractogram_apply_transform \
+              "${in_trk}" \
+              "${subject_dir}/tractoflow/${nsub}__T1w.nii.gz" \
+              "${output_dir}/${nsub}/orig_space/transfo/2orig_0GenericAffine.mat" \
+              "${out_trk}" \
+              --inverse \
+              --in_deformation "${output_dir}/${nsub}/orig_space/transfo/2orig_1InverseWarp.nii.gz" \
+              --remove_invalid -f
+        else
+            echo "WARN: Final MNI bundle not found for ${nside} ${bundle}, skipping back-to-orig."
+        fi
+    done
+done
+
+echo "|------------- 9) Done -------------|"
+echo ""
